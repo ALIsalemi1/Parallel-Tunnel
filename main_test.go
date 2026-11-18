@@ -17,6 +17,22 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+func TestPoolWaiterWakesWhenCapacityReturns(t *testing.T) {
+	p := newPool()
+	// An empty pool exposes a notification that closes when a carrier arrives.
+	c, changed := p.acquire(1, nil)
+	if c != nil {
+		t.Fatal("empty pool returned a carrier")
+	}
+	carrier := &carrier{}
+	p.add(carrier)
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("adding a carrier did not wake the waiter")
+	}
+}
+
 func TestCarrierFailureLeavesOtherStreamsAlive(t *testing.T) {
 	listen := func() net.Listener {
 		t.Helper()
@@ -262,3 +278,4 @@ func testTLS(t *testing.T) (*tls.Config, *tls.Config) {
 			ServerName: "127.0.0.1", RootCAs: roots,
 		}
 }
+

@@ -176,12 +176,22 @@ type carrier struct {
 type pool struct {
 	mu       sync.Mutex
 	carriers []*carrier
+	changed  chan struct{}
+	next     int
+}
+
+func newPool() *pool { return &pool{changed: make(chan struct{})} }
+
+func (p *pool) signal() {
+	close(p.changed)
+	p.changed = make(chan struct{})
 }
 
 func (p *pool) add(c *carrier) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.carriers = append(p.carriers, c)
+	p.signal()
 }
 
 func (p *pool) remove(c *carrier) {
@@ -193,16 +203,19 @@ func (p *pool) remove(c *carrier) {
 			p.carriers[i] = p.carriers[last]
 			p.carriers[last] = nil
 			p.carriers = p.carriers[:last]
+			p.signal()
 			return
 		}
 	}
 }
 
-func (p *pool) acquire(limit int, skip map[*carrier]bool) *carrier {
+func (p *pool) acquire(limit int, skip map[*carrier]bool) (*carrier, <-chan struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var choice *carrier
-	for _, c := range p.carriers {
+	for i := range p.carriers {
+		index := (p.next + i) % len(p.carriers)
+		c := p.carriers[index]
 		if skip[c] || c.active >= limit || c.session.IsClosed() {
 			continue
 		}
@@ -212,14 +225,21 @@ func (p *pool) acquire(limit int, skip map[*carrier]bool) *carrier {
 	}
 	if choice != nil {
 		choice.active++
+		for i, c := range p.carriers {
+			if c == choice {
+				p.next = (i + 1) % len(p.carriers)
+				break
+			}
+		}
 	}
-	return choice
+	return choice, p.changed
 }
 
 func (p *pool) release(c *carrier) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c.active--
+	p.signal()
 }
 
 func serve(ctx context.Context, s settings, cfg *tls.Config) error {
@@ -239,7 +259,7 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 	defer stop()
 	log.Printf("carrier listener %s, forwarded TCP listener %s", tunnel.Addr(), forward.Addr())
 
-	p := new(pool)
+	p := newPool()
 	slots := make(chan struct{}, s.carriers)
 	handshakes := make(chan struct{}, 32)
 	errs := make(chan error, 2)
@@ -286,7 +306,7 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 		})
 	}()
 	go func() {
-		errs <- accept(forward, make(chan struct{}, s.carriers*s.streams), func(conn net.Conn, _ func()) {
+		errs <- accept(forward, make(chan struct{}, s.carriers*s.streams+128), func(conn net.Conn, _ func()) {
 			forwardStream(ctx, conn, p, s.streams)
 		})
 	}()
@@ -319,10 +339,20 @@ func accept(listener net.Listener, slots chan struct{}, handle func(net.Conn, fu
 
 func forwardStream(ctx context.Context, conn net.Conn, p *pool, limit int) {
 	tried := make(map[*carrier]bool)
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
 	for ctx.Err() == nil {
-		c := p.acquire(limit, tried)
+		c, changed := p.acquire(limit, tried)
 		if c == nil {
-			return
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				return
+			case <-changed:
+				clear(tried)
+				continue
+			}
 		}
 		stream, err := c.session.OpenStream()
 		if err == nil {
@@ -442,3 +472,4 @@ func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 	}
 	<-results
 }
+
