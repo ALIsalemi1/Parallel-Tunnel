@@ -27,7 +27,7 @@ const (
 	authTimeout = 10 * time.Second
 	dialTimeout = 5 * time.Second
 	protocol    = "parallel-tunnel/1"
-	maxCarriers = 256
+	maxCarriers = 320
 	maxStreams  = 128
 )
 

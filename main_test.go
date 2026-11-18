@@ -33,7 +33,7 @@ func TestPoolWaiterWakesWhenCapacityReturns(t *testing.T) {
 	}
 }
 
-func TestPoolSupports32768ConcurrentStreams(t *testing.T) {
+func TestPoolSupports40960ConcurrentStreams(t *testing.T) {
 	if testing.Short() {
 		t.Skip("large session pool")
 	}
