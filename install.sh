@@ -26,7 +26,7 @@ fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-revision=ed4f96ef334e90745a25cedb4a4ef6c3905cc558
+revision=41f9bd419fe593b6c381a8f49151b4efa270131f
 base="https://raw.githubusercontent.com/ALIsalemi1/Parallel-Tunnel/$revision"
 for file in go.mod go.sum main.go; do
   curl --retry 3 -fsSL "$base/$file" -o "$tmp/$file"
