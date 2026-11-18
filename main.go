@@ -27,6 +27,8 @@ const (
 	authTimeout = 10 * time.Second
 	dialTimeout = 5 * time.Second
 	protocol    = "parallel-tunnel/1"
+	maxCarriers = 256
+	maxStreams  = 128
 )
 
 type settings struct {
@@ -72,9 +74,9 @@ func run(ctx context.Context, args []string) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || s.carriers < 1 || s.carriers > 64 || s.streams < 1 || s.streams > 128 ||
+	if flags.NArg() != 0 || s.carriers < 1 || s.carriers > maxCarriers || s.streams < 1 || s.streams > maxStreams ||
 		s.pingInterval < time.Second || s.pingTimeout < time.Second {
-		return errors.New("expected carriers 1–64, streams 1–128, and ping durations of at least 1s")
+		return fmt.Errorf("expected carriers 1–%d, streams 1–%d, and ping durations of at least 1s", maxCarriers, maxStreams)
 	}
 	host, _, err := net.SplitHostPort(s.tunnelAddr)
 	if err != nil {
@@ -213,6 +215,7 @@ func (p *pool) acquire(limit int, skip map[*carrier]bool) (*carrier, <-chan stru
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var choice *carrier
+	var chosenIndex int
 	for i := range p.carriers {
 		index := (p.next + i) % len(p.carriers)
 		c := p.carriers[index]
@@ -221,16 +224,12 @@ func (p *pool) acquire(limit int, skip map[*carrier]bool) (*carrier, <-chan stru
 		}
 		if choice == nil || c.active < choice.active {
 			choice = c
+			chosenIndex = index
 		}
 	}
 	if choice != nil {
 		choice.active++
-		for i, c := range p.carriers {
-			if c == choice {
-				p.next = (i + 1) % len(p.carriers)
-				break
-			}
-		}
+		p.next = (chosenIndex + 1) % len(p.carriers)
 	}
 	return choice, p.changed
 }
@@ -472,4 +471,3 @@ func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 	}
 	<-results
 }
-

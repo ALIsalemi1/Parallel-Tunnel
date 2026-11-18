@@ -33,6 +33,55 @@ func TestPoolWaiterWakesWhenCapacityReturns(t *testing.T) {
 	}
 }
 
+func TestPoolSupports32768ConcurrentStreams(t *testing.T) {
+	if testing.Short() {
+		t.Skip("large session pool")
+	}
+	p := newPool()
+	cfg := yamux.DefaultConfig()
+	cfg.AcceptBacklog = maxStreams
+	cfg.EnableKeepAlive = false
+	peers := make(map[*carrier]*yamux.Session, maxCarriers)
+	for range maxCarriers {
+		left, right := net.Pipe()
+		t.Cleanup(func() { left.Close(); right.Close() })
+		client, err := yamux.Client(left, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { client.Close() })
+		server, err := yamux.Server(right, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { server.Close() })
+		c := &carrier{session: client}
+		p.add(c)
+		peers[c] = server
+	}
+	const capacity = maxCarriers * maxStreams
+	for i := range capacity {
+		c, _ := p.acquire(maxStreams, nil)
+		if c == nil {
+			t.Fatalf("pool full at %d streams", i)
+		}
+		if _, err := c.session.OpenStream(); err != nil {
+			t.Fatalf("open stream %d: %v", i, err)
+		}
+		if _, err := peers[c].AcceptStream(); err != nil {
+			t.Fatalf("accept stream %d: %v", i, err)
+		}
+	}
+	if c, _ := p.acquire(maxStreams, nil); c != nil {
+		t.Fatal("pool exceeded configured capacity")
+	}
+	for c, peer := range peers {
+		if c.active != maxStreams || peer.NumStreams() != maxStreams {
+			t.Fatalf("carrier occupancy = %d, peer = %d", c.active, peer.NumStreams())
+		}
+	}
+}
+
 func TestCarrierFailureLeavesOtherStreamsAlive(t *testing.T) {
 	listen := func() net.Listener {
 		t.Helper()
@@ -278,4 +327,3 @@ func testTLS(t *testing.T) (*tls.Config, *tls.Config) {
 			ServerName: "127.0.0.1", RootCAs: roots,
 		}
 }
-
