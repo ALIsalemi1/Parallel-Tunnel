@@ -33,8 +33,14 @@ for file in go.mod go.sum main.go; do
 done
 archive="go1.25.0.linux-$arch.tar.gz"
 echo "Downloading Go toolchain for $arch..."
-curl --retry 3 -fsSL "https://go.dev/dl/$archive" -o "$tmp/$archive"
-echo "$checksum  $tmp/$archive" | sha256sum -c -
+download_go() {
+  curl --retry 2 --connect-timeout 15 -fsSL "$1/$archive" -o "$tmp/$archive" &&
+    printf '%s  %s\n' "$checksum" "$tmp/$archive" | sha256sum -c -
+}
+if ! download_go https://go.dev/dl; then
+  echo "Trying the Go mirror..." >&2
+  download_go https://mirrors.aliyun.com/golang
+fi
 tar -xzf "$tmp/$archive" -C "$tmp"
 echo "Building Parallel Tunnel..."
 (
@@ -44,4 +50,5 @@ echo "Building Parallel Tunnel..."
 install -m 0755 "$tmp/parallel-tunnel" /usr/local/bin/parallel-tunnel
 echo "Installed /usr/local/bin/parallel-tunnel"
 echo "Setup instructions: https://github.com/ALIsalemi1/Parallel-Tunnel#readme"
+
 
