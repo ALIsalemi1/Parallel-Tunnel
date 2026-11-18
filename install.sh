@@ -50,5 +50,3 @@ echo "Building Parallel Tunnel..."
 install -m 0755 "$tmp/parallel-tunnel" /usr/local/bin/parallel-tunnel
 echo "Installed /usr/local/bin/parallel-tunnel"
 echo "Setup instructions: https://github.com/ALIsalemi1/Parallel-Tunnel#readme"
-
-
