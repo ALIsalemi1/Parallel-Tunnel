@@ -53,7 +53,7 @@ func run(ctx context.Context, args []string) error {
 		return runPanel(ctx, args[1:])
 	}
 	if len(args) == 0 || (args[0] != "server" && args[0] != "agent") {
-		return errors.New("usage: parallel-tunnel {server|agent} -help")
+		return errors.New("usage: parallel-tunnel {server|agent|panel} -help")
 	}
 	server := args[0] == "server"
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)

@@ -303,3 +303,11 @@ func TestPanelBindFailureIsVisible(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestPanelCookieNamesIsolateLocalPorts(t *testing.T) {
+	a := httptest.NewRequest("GET", "http://127.0.0.1:19091/api/status", nil)
+	b := httptest.NewRequest("GET", "http://127.0.0.1:19092/api/status", nil)
+	if panelCookieName(a) == panelCookieName(b) {
+		t.Fatal("panel cookies collide across ports")
+	}
+}

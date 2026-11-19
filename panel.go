@@ -315,7 +315,7 @@ func (p *panel) handler() http.Handler {
 			p.login(w, r)
 			return
 		}
-		cookie, e := r.Cookie("pt_session")
+		cookie, e := r.Cookie(panelCookieName(r))
 		if e != nil {
 			jsonResponse(w, 401, map[string]string{"error": "ورود لازم است"})
 			return
@@ -342,7 +342,7 @@ func (p *panel) handler() http.Handler {
 			p.mu.Lock()
 			delete(p.sessions, cookie.Value)
 			p.mu.Unlock()
-			http.SetCookie(w, &http.Cookie{Name: "pt_session", Value: "", Path: "/", HttpOnly: true, Secure: p.secure, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+			http.SetCookie(w, &http.Cookie{Name: panelCookieName(r), Value: "", Path: "/", HttpOnly: true, Secure: p.secure, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 			jsonResponse(w, 200, map[string]bool{"ok": true})
 		case r.URL.Path == "/api/status" && r.Method == "GET":
 			p.status(w)
@@ -424,7 +424,7 @@ func (p *panel) login(w http.ResponseWriter, r *http.Request) {
 	delete(p.attempts, host)
 	p.sessions[id] = loginSession{now.Add(8 * time.Hour), csrf}
 	p.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "pt_session", Value: id, Path: "/", HttpOnly: true, Secure: p.secure, SameSite: http.SameSiteStrictMode, MaxAge: 8 * 3600})
+	http.SetCookie(w, &http.Cookie{Name: panelCookieName(r), Value: id, Path: "/", HttpOnly: true, Secure: p.secure, SameSite: http.SameSiteStrictMode, MaxAge: 8 * 3600})
 	jsonResponse(w, 200, map[string]string{"csrf": csrf})
 }
 func (p *panel) status(w http.ResponseWriter) {
@@ -643,4 +643,10 @@ func runPanel(ctx context.Context, args []string) error {
 		return nil
 	}
 	return e
+}
+
+// Cookies do not isolate by TCP port; use an origin-specific name for multiple panels.
+func panelCookieName(r *http.Request) string {
+	sum := sha256.Sum256([]byte(r.Host))
+	return "pt_session_" + hex.EncodeToString(sum[:8])
 }
