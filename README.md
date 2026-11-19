@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="parallel-tunnel-banner.png" alt="Parallel Tunnel — Reverse TCP, Parallel TLS and Yamux" width="100%">
+
 # Parallel Tunnel
 
 **تانل معکوس TCP با اتصال‌های موازی و رمزنگاری TLS**
