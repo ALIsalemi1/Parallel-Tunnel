@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"github.com/hashicorp/yamux"
 	"io"
 	"log"
@@ -212,4 +213,34 @@ func TestStallAwareSelectionAndFallback(t *testing.T) {
 		t.Fatal("all-stalled fallback did not preserve least-stream selection")
 	}
 	p.release(picked)
+}
+
+func TestAgentCountsRejectedAuthentication(t *testing.T) {
+	serverTLS, agentTLS := testTLS(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		raw, e := listener.Accept()
+		if e != nil {
+			return
+		}
+		defer raw.Close()
+		var token [32]byte
+		token[0] = 42
+		_ = authenticate(ctx, tls.Server(raw, serverTLS), token, func() bool { return true })
+	}()
+	m := newTelemetry("agent")
+	ctx = context.WithValue(ctx, telemetryKey{}, m)
+	err = agentCarrier(ctx, settings{tunnelAddr: listener.Addr().String()}, agentTLS, 1)
+	if err == nil || m.handshakeErrors.Load() != 1 {
+		t.Fatal("rejected authentication not counted", err)
+	}
+	<-done
 }

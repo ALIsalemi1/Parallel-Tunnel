@@ -508,11 +508,14 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 	defer raw.Close()
 	stop := context.AfterFunc(ctx, func() { raw.Close() })
 	defer stop()
+	m := telemetryFrom(ctx)
 	conn := tls.Client(raw, cfg)
 	if err := authenticate(ctx, conn, s.token, nil); err != nil {
+		if m != nil {
+			m.handshakeErrors.Add(1)
+		}
 		return err
 	}
-	m := telemetryFrom(ctx)
 	var transport net.Conn = conn
 	muxCfg := s.muxConfig()
 	var observed *observedConn
