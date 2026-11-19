@@ -49,6 +49,9 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "panel" {
+		return runPanel(ctx, args[1:])
+	}
 	if len(args) == 0 || (args[0] != "server" && args[0] != "agent") {
 		return errors.New("usage: parallel-tunnel {server|agent} -help")
 	}
@@ -256,7 +259,7 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 	defer forward.Close()
 	stop := context.AfterFunc(ctx, func() { tunnel.Close(); forward.Close() })
 	defer stop()
-	log.Printf("carrier listener %s, forwarded TCP listener %s", tunnel.Addr(), forward.Addr())
+	event(ctx, "carrier listener %s, forwarded TCP listener %s", tunnel.Addr(), forward.Addr())
 
 	p := newPool()
 	slots := make(chan struct{}, s.carriers)
@@ -286,7 +289,7 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 			// Release the handshake limit once the connection has authenticated.
 			done()
 			if err != nil {
-				log.Printf("carrier handshake from %s: %v", raw.RemoteAddr(), err)
+				event(ctx, "carrier handshake from %s: %v", raw.RemoteAddr(), err)
 				return
 			}
 			session, err := yamux.Client(conn, s.muxConfig())
@@ -299,9 +302,11 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 			p.add(c)
 			defer p.remove(c)
 			peer := raw.RemoteAddr()
-			log.Printf("carrier up: %s", peer)
+			carrierDelta(ctx, 1)
+			defer carrierDelta(ctx, -1)
+			event(ctx, "carrier up: %s", peer)
 			<-session.CloseChan()
-			log.Printf("carrier down: %s", peer)
+			event(ctx, "carrier down: %s", peer)
 		})
 	}()
 	go func() {
@@ -361,7 +366,7 @@ func forwardStream(ctx context.Context, conn net.Conn, p *pool, limit int) {
 		}
 		p.release(c)
 		tried[c] = true
-		log.Printf("carrier stream open failed: %v", err)
+		event(ctx, "carrier stream open failed: %v", err)
 	}
 }
 
@@ -376,7 +381,7 @@ func runAgent(ctx context.Context, s settings, cfg *tls.Config) error {
 				if ctx.Err() != nil {
 					return
 				}
-				log.Printf("carrier %d down: %v", i, err)
+				event(ctx, "carrier %d down: %v", i, err)
 				if time.Since(start) >= time.Minute {
 					backoff = time.Second
 				}
@@ -413,7 +418,9 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 		return err
 	}
 	defer session.Close()
-	log.Printf("carrier %d up: %s", id, raw.RemoteAddr())
+	carrierDelta(ctx, 1)
+	defer carrierDelta(ctx, -1)
+	event(ctx, "carrier %d up: %s", id, raw.RemoteAddr())
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	slots := make(chan struct{}, s.streams)
@@ -428,7 +435,7 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 				defer func() { <-slots }()
 				target, err := dialer.DialContext(ctx, "tcp", s.localAddr)
 				if err != nil {
-					log.Printf("backend dial failed: %v", err)
+					event(ctx, "backend dial failed: %v", err)
 					stream.Close()
 					return
 				}
@@ -442,6 +449,11 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 
 func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 	defer tcp.Close()
+	m := statsFrom(ctx)
+	if m != nil {
+		m.active.Add(1)
+		defer m.active.Add(-1)
+	}
 	defer stream.Close()
 	stop := context.AfterFunc(ctx, func() {
 		now := time.Now()
@@ -451,14 +463,14 @@ func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 	defer stop()
 	results := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(stream, tcp)
+		_, err := copyMeasured(stream, tcp, m, true)
 		if err == nil {
 			err = stream.Close() // Yamux sends FIN and leaves the read side open.
 		}
 		results <- err
 	}()
 	go func() {
-		_, err := io.Copy(tcp, stream)
+		_, err := copyMeasured(tcp, stream, m, false)
 		if err == nil {
 			err = tcp.CloseWrite()
 		}
