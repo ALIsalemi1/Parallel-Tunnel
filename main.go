@@ -36,6 +36,8 @@ type settings struct {
 	certFile, keyFile, caFile, tlsName string
 	carriers, streams                  int
 	pingInterval, pingTimeout          time.Duration
+	statsInterval                      time.Duration
+	avoidStalledAfter                  time.Duration
 	token                              [32]byte
 }
 
@@ -59,6 +61,8 @@ func run(ctx context.Context, args []string) error {
 	flags.StringVar(&s.tokenFile, "token-file", "", "file containing the shared 64-character hex token")
 	flags.DurationVar(&s.pingInterval, "ping-interval", 20*time.Second, "interval between carrier liveness probes")
 	flags.DurationVar(&s.pingTimeout, "ping-timeout", 30*time.Second, "carrier ping and write timeout")
+	flags.DurationVar(&s.statsInterval, "stats-interval", 30*time.Second, "diagnostic log interval; 0 disables telemetry, minimum 5s")
+	flags.DurationVar(&s.avoidStalledAfter, "avoid-stalled-after", 0, "prefer other carriers when a write stalls this long; 0 preserves stream-count balancing")
 	flags.IntVar(&s.streams, "streams", 32, "maximum simultaneous streams per carrier")
 	if server {
 		flags.StringVar(&s.localAddr, "listen", "127.0.0.1:1081", "forwarded TCP listener")
@@ -73,6 +77,12 @@ func run(ctx context.Context, args []string) error {
 	}
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
+	}
+	if s.statsInterval < 0 || (s.statsInterval > 0 && s.statsInterval < 5*time.Second) {
+		return errors.New("stats-interval must be 0 or at least 5s")
+	}
+	if s.avoidStalledAfter < 0 || (s.avoidStalledAfter > 0 && (s.avoidStalledAfter < time.Second || s.statsInterval == 0)) {
+		return errors.New("avoid-stalled-after must be 0 or at least 1s with telemetry enabled")
 	}
 	if flags.NArg() != 0 || s.carriers < 1 || s.carriers > maxCarriers || s.streams < 1 || s.streams > maxStreams ||
 		s.pingInterval < time.Second || s.pingTimeout < time.Second {
@@ -97,6 +107,14 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("decode token: %w", err)
 	}
 
+	if s.statsInterval > 0 {
+		telemetry := newTelemetry(args[0])
+		child, cancel := context.WithCancel(ctx)
+		ctx = context.WithValue(child, telemetryKey{}, telemetry)
+		done := make(chan struct{})
+		go func() { defer close(done); telemetry.report(ctx, s.statsInterval) }()
+		defer func() { cancel(); <-done }()
+	}
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{protocol}}
 	if server {
 		cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
@@ -171,8 +189,9 @@ func authenticate(ctx context.Context, conn *tls.Conn, token [32]byte, admit fun
 }
 
 type carrier struct {
-	session *yamux.Session
-	active  int
+	session  *yamux.Session
+	active   int
+	observed *observedConn
 }
 
 type pool struct {
@@ -212,22 +231,40 @@ func (p *pool) remove(c *carrier) {
 }
 
 func (p *pool) acquire(limit int, skip map[*carrier]bool) (*carrier, <-chan struct{}) {
+	return p.acquireAvoidingStalls(limit, skip, 0)
+}
+func (p *pool) acquireAvoidingStalls(limit int, skip map[*carrier]bool, threshold time.Duration) (*carrier, <-chan struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var choice *carrier
 	var chosenIndex int
+	var choiceStalled, sawStalled bool
+	var now int64
+	if threshold > 0 {
+		now = time.Now().UnixNano()
+	}
 	for i := range p.carriers {
 		index := (p.next + i) % len(p.carriers)
 		c := p.carriers[index]
 		if skip[c] || c.active >= limit || c.session.IsClosed() {
 			continue
 		}
-		if choice == nil || c.active < choice.active {
+		stalled := false
+		if threshold > 0 && c.observed != nil {
+			started := c.observed.writingSince.Load()
+			stalled = started != 0 && now-started >= int64(threshold)
+		}
+		sawStalled = sawStalled || stalled
+		if choice == nil || (choiceStalled && !stalled) || (choiceStalled == stalled && c.active < choice.active) {
 			choice = c
 			chosenIndex = index
+			choiceStalled = stalled
 		}
 	}
 	if choice != nil {
+		if sawStalled && !choiceStalled && choice.observed != nil {
+			choice.observed.owner.stallAvoided.Add(1)
+		}
 		choice.active++
 		p.next = (chosenIndex + 1) % len(p.carriers)
 	}
@@ -259,6 +296,7 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 	log.Printf("carrier listener %s, forwarded TCP listener %s", tunnel.Addr(), forward.Addr())
 
 	p := newPool()
+	m := telemetryFrom(ctx)
 	slots := make(chan struct{}, s.carriers)
 	handshakes := make(chan struct{}, 32)
 	errs := make(chan error, 2)
@@ -286,18 +324,35 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 			// Release the handshake limit once the connection has authenticated.
 			done()
 			if err != nil {
+				if m != nil {
+					m.handshakeErrors.Add(1)
+				}
 				log.Printf("carrier handshake from %s: %v", raw.RemoteAddr(), err)
 				return
 			}
-			session, err := yamux.Client(conn, s.muxConfig())
+			var transport net.Conn = conn
+			muxCfg := s.muxConfig()
+			var observed *observedConn
+			if m != nil {
+				observed = observeConn(conn, m)
+				transport = observed
+				muxCfg.LogOutput = nil
+				muxCfg.Logger = diagnosticLogger{log.Default(), observed}
+			}
+			session, err := yamux.Client(transport, muxCfg)
 			if err != nil {
 				log.Print(err)
 				return
 			}
 			defer session.Close()
-			c := &carrier{session: session}
+			c := &carrier{session: session, observed: observed}
 			p.add(c)
 			defer p.remove(c)
+			if observed != nil {
+				m.register(observed)
+				defer m.unregister(observed)
+				defer func(parent context.Context) { observed.closed(parent, session.NumStreams()) }(ctx)
+			}
 			peer := raw.RemoteAddr()
 			log.Printf("carrier up: %s", peer)
 			<-session.CloseChan()
@@ -305,8 +360,8 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 		})
 	}()
 	go func() {
-		errs <- accept(forward, make(chan struct{}, s.carriers*s.streams+128), func(conn net.Conn, _ func()) {
-			forwardStream(ctx, conn, p, s.streams)
+		errs <- acceptObserved(forward, make(chan struct{}, s.carriers*s.streams+128), m, func(conn net.Conn, _ func()) {
+			forwardStreamPolicy(ctx, conn, p, s.streams, s.avoidStalledAfter)
 		})
 	}()
 	err = <-errs
@@ -317,10 +372,16 @@ func serve(ctx context.Context, s settings, cfg *tls.Config) error {
 }
 
 func accept(listener net.Listener, slots chan struct{}, handle func(net.Conn, func())) error {
+	return acceptObserved(listener, slots, nil, handle)
+}
+func acceptObserved(listener net.Listener, slots chan struct{}, m *telemetry, handle func(net.Conn, func())) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			return err
+		}
+		if m != nil {
+			m.accepted.Add(1)
 		}
 		select {
 		case slots <- struct{}{}:
@@ -331,35 +392,78 @@ func accept(listener net.Listener, slots chan struct{}, handle func(net.Conn, fu
 				handle(conn, done)
 			}()
 		default:
+			if m != nil {
+				m.rejected.Add(1)
+			}
 			conn.Close()
 		}
 	}
 }
 
 func forwardStream(ctx context.Context, conn net.Conn, p *pool, limit int) {
+	forwardStreamPolicy(ctx, conn, p, limit, 0)
+}
+func forwardStreamPolicy(ctx context.Context, conn net.Conn, p *pool, limit int, threshold time.Duration) {
+	m := telemetryFrom(ctx)
+	started := time.Now()
+	waited := false
+	defer func() {
+		if m != nil && waited {
+			m.waiting.Add(-1)
+			observeMax(&m.maxQueueNS, time.Since(started).Nanoseconds())
+		}
+	}()
 	tried := make(map[*carrier]bool)
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
 	for ctx.Err() == nil {
-		c, changed := p.acquire(limit, tried)
+		select {
+		case <-timer.C:
+			if m != nil {
+				m.queueTimeouts.Add(1)
+			}
+			return
+		default:
+		}
+		c, changed := p.acquireAvoidingStalls(limit, tried, threshold)
 		if c == nil {
+			if m != nil && !waited {
+				waited = true
+				m.queueWaits.Add(1)
+				m.waiting.Add(1)
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
+				if m != nil {
+					m.queueTimeouts.Add(1)
+				}
 				return
 			case <-changed:
 				clear(tried)
 				continue
 			}
 		}
+		opening := time.Now()
 		stream, err := c.session.OpenStream()
+		if m != nil {
+			observeMax(&m.maxOpenNS, time.Since(opening).Nanoseconds())
+		}
 		if err == nil {
 			defer p.release(c)
+			if m != nil && waited {
+				m.waiting.Add(-1)
+				observeMax(&m.maxQueueNS, time.Since(started).Nanoseconds())
+				waited = false
+			}
 			relay(ctx, conn.(*net.TCPConn), stream)
 			return
 		}
 		p.release(c)
+		if m != nil {
+			m.openErrors.Add(1)
+		}
 		tried[c] = true
 		log.Printf("carrier stream open failed: %v", err)
 	}
@@ -408,11 +512,26 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 	if err := authenticate(ctx, conn, s.token, nil); err != nil {
 		return err
 	}
-	session, err := yamux.Server(conn, s.muxConfig())
+	m := telemetryFrom(ctx)
+	var transport net.Conn = conn
+	muxCfg := s.muxConfig()
+	var observed *observedConn
+	if m != nil {
+		observed = observeConn(conn, m)
+		transport = observed
+		muxCfg.LogOutput = nil
+		muxCfg.Logger = diagnosticLogger{log.Default(), observed}
+	}
+	session, err := yamux.Server(transport, muxCfg)
 	if err != nil {
 		return err
 	}
 	defer session.Close()
+	if observed != nil {
+		m.register(observed)
+		defer m.unregister(observed)
+		defer func(parent context.Context) { observed.closed(parent, session.NumStreams()) }(ctx)
+	}
 	log.Printf("carrier %d up: %s", id, raw.RemoteAddr())
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -422,12 +541,22 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 		if err != nil {
 			return err
 		}
+		if m != nil {
+			m.accepted.Add(1)
+		}
 		select {
 		case slots <- struct{}{}:
 			go func() {
 				defer func() { <-slots }()
+				dialStarted := time.Now()
 				target, err := dialer.DialContext(ctx, "tcp", s.localAddr)
+				if m != nil {
+					observeMax(&m.maxBackendNS, time.Since(dialStarted).Nanoseconds())
+				}
 				if err != nil {
+					if m != nil {
+						m.backendErrors.Add(1)
+					}
 					log.Printf("backend dial failed: %v", err)
 					stream.Close()
 					return
@@ -435,6 +564,9 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 				relay(ctx, target.(*net.TCPConn), stream)
 			}()
 		default:
+			if m != nil {
+				m.rejected.Add(1)
+			}
 			stream.Close()
 		}
 	}
@@ -442,6 +574,11 @@ func agentCarrier(ctx context.Context, s settings, cfg *tls.Config, id int) erro
 
 func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 	defer tcp.Close()
+	m := telemetryFrom(ctx)
+	if m != nil {
+		m.activeRelays.Add(1)
+		defer m.activeRelays.Add(-1)
+	}
 	defer stream.Close()
 	stop := context.AfterFunc(ctx, func() {
 		now := time.Now()
@@ -464,10 +601,14 @@ func relay(ctx context.Context, tcp *net.TCPConn, stream *yamux.Stream) {
 		}
 		results <- err
 	}()
-	if err := <-results; err != nil {
+	firstError := <-results
+	if firstError != nil {
 		now := time.Now()
 		tcp.SetDeadline(now)
 		stream.SetDeadline(now)
 	}
-	<-results
+	secondError := <-results
+	if m != nil && ctx.Err() == nil && (firstError != nil || secondError != nil) {
+		m.relayErrors.Add(1)
+	}
 }
