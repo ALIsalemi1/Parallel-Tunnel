@@ -102,6 +102,7 @@ func TestCarrierFailureLeavesOtherStreamsAlive(t *testing.T) {
 	s.token[0] = 42
 	serverTLS, agentTLS := testTLS(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	ctx = context.WithValue(ctx, telemetryKey{}, newTelemetry("integration"))
 	stopped := make(chan error, 1)
 	go func() { stopped <- serve(ctx, s, serverTLS) }()
 	t.Cleanup(func() {
@@ -298,7 +299,7 @@ func TestCarrierFailureLeavesOtherStreamsAlive(t *testing.T) {
 	}
 }
 
-func testTLS(t *testing.T) (*tls.Config, *tls.Config) {
+func testTLS(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
