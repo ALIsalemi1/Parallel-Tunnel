@@ -237,8 +237,8 @@ func TestAgentCountsRejectedAuthentication(t *testing.T) {
 		_ = authenticate(ctx, tls.Server(raw, serverTLS), token, func() bool { return true })
 	}()
 	m := newTelemetry("agent")
-	ctx = context.WithValue(ctx, telemetryKey{}, m)
-	err = agentCarrier(ctx, settings{tunnelAddr: listener.Addr().String()}, agentTLS, 1)
+	agentCtx := context.WithValue(ctx, telemetryKey{}, m)
+	err = agentCarrier(agentCtx, settings{tunnelAddr: listener.Addr().String()}, agentTLS, 1)
 	if err == nil || m.handshakeErrors.Load() != 1 {
 		t.Fatal("rejected authentication not counted", err)
 	}
